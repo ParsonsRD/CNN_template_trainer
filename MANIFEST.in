@@ -1,0 +1,2 @@
+include template_builder/configs/*
+include template_builder/data/*

@@ -1,0 +1,17 @@
+fingerprint.pb
+images.npz
+keras_metadata.pb
+saved_model.pb
+template-fitter.provenance.log
+training.log
+build/lib/CNN_template_trainer/nn_fitter.py
+build/lib/CNN_template_trainer/template_fitter.py
+CNN_template_trainer/template_fitter.py
+CNN_template_trainer.egg-info/dependency_links.txt
+CNN_template_trainer.egg-info/entry_points.txt
+CNN_template_trainer.egg-info/PKG-INFO
+CNN_template_trainer.egg-info/SOURCES.txt
+CNN_template_trainer.egg-info/top_level.txt
+dist/CNN_template_trainer-1.0-py3.10.egg
+variables/variables.data-00000-of-00001
+variables/variables.index

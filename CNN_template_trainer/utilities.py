@@ -115,7 +115,7 @@ def create_model_cnn(cnn_input_shape, filters=50, number_of_layers=14):
 
     # OK first we have out CNN input layer, it's time distributed to account for the multiple telescope types
 
-    l2_reg = l2(0.0005)
+    l2_reg = l2(5e-5)
 
     # Fit image pixels using a multi layer perceptron
     model = Sequential()

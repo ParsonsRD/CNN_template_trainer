@@ -3,6 +3,7 @@ Generate DL1 (a or b) output files in HDF5 format from {R0,R1,DL0} inputs.
 """
 # pylint: disable=W0201
 import sys
+import os
 
 from tqdm.auto import tqdm
 from astropy.coordinates import SkyCoord, AltAz
@@ -159,7 +160,7 @@ class TemplateFitter(Tool):
         self.input_file_list = self.input_files.split(",")
 
         self.focal_length_choice='EFFECTIVE'
-
+        
         try:
              self.event_source = EventSource(input_url=self.input_file_list[0], parent=self, 
                         focal_length_choice=self.focal_length_choice)
@@ -223,6 +224,9 @@ class TemplateFitter(Tool):
         self.event_source.subarray.info(printer=self.log.info)
 
         for input_file in self.input_file_list:
+            if not os.path.exists(input_file):
+                continue
+
             self.event_source = EventSource(input_url=input_file, parent=self, 
                 focal_length_choice=self.focal_length_choice)
             self.point, self.xmax_scale, self.tilt_tel = None, None, None
@@ -255,20 +259,28 @@ class TemplateFitter(Tool):
 
         if self.load_images:
             with np.load(self.input_files) as data:
-                inputs= data['inputs']
-                target = data['target']
+                try:
+                    inputs= data['inputs']
+                    target = data['target']
+                except:
+                    inputs= data['input_data']
+                    target = data['output_data']
         else:
             inputs = np.stack((self.x_all, self.y_all, self.impact_all, 
                             self.en_all, self.xmax_all, self.x0_all), axis=3)
-            target = np.array(self.image_all)
+            inputs = inputs.astype("float32")
+            target = np.array(self.image_all).astype("float32")
 
         if self.save_images != " ":
             np.savez_compressed(self.save_images, inputs=inputs, target=target) 
-
+            
+#        inputs[:,:,:,1] = np.abs(inputs[:,:,:,1])
         inputs[:,:,:,2:] = np.log10(inputs[:,:,:,2:]) 
+        inputs = inputs[:,:,:,:-1]
+        print(inputs.shape)
         inputs = np.nan_to_num(inputs, posinf=0, neginf=0)
         target = np.nan_to_num(target, posinf=0, neginf=0)
-
+        
         model = self.generate_templates(inputs, target)
         model.save(self.output_file)
 
@@ -285,7 +297,9 @@ class TemplateFitter(Tool):
         weight_factor = (energy/(self.reweight_energy * u.TeV))**self.reweight_index
         if weight_factor != 1.:
             random_value = np.random.rand()
-            if random_value < weight_factor:
+            #print(weight_factor, random_value)
+            if random_value > weight_factor:
+                #print("reject")
                 return
 
         # When calculating alt we have to account for the case when it is rounded
@@ -351,14 +365,15 @@ class TemplateFitter(Tool):
             x = nom_coord.fov_lon.to(u.deg)
             y = nom_coord.fov_lat.to(u.deg)
 
+            tel_num = np.argwhere(self.event_source.subarray.tel_ids == tel_id)
             # Calculate expected rotation angle of the image
-            phi = np.arctan2((self.tilt_tel.y[tel_id - 1] - tilt_core_true.y),
-                                (self.tilt_tel.x[tel_id - 1] - tilt_core_true.x)) + \
+            phi = np.arctan2((self.tilt_tel.y[tel_num] - tilt_core_true.y),
+                                (self.tilt_tel.x[tel_num] - tilt_core_true.x)) + \
                     90 * u.deg
 
             # And the impact distance of the shower
-            impact = np.sqrt(np.power(self.tilt_tel.x[tel_id - 1] - tilt_core_true.x, 2) +
-                                np.power(self.tilt_tel.y[tel_id - 1] - tilt_core_true.y, 2)). \
+            impact = np.sqrt(np.power(self.tilt_tel.x[tel_num] - tilt_core_true.x, 2) +
+                                np.power(self.tilt_tel.y[tel_num] - tilt_core_true.y, 2)). \
                 to(u.m).value
             
             # now rotate and translate our images such that they lie on top of one
@@ -366,7 +381,7 @@ class TemplateFitter(Tool):
             x, y = rotate_translate(x, y,
                                     source_direction.fov_lon,
                                     source_direction.fov_lat, phi)
-            #x *= -1 # Reverse x axis to fit HESS convention
+            x *= -1 # Reverse x axis to fit HESS convention
             x, y = x.ravel(), y.ravel()
 
             # Store simulated Xmax
@@ -413,12 +428,17 @@ class TemplateFitter(Tool):
             _type_: _description_
         """
         model = create_model_cnn(inputs.shape[1:], filters=self.filters, number_of_layers=self.layers)
+        impacts = 10**inputs[:, 20,20,2]
+        weight = (impacts/150)**-0.7
+        weight =  np.expand_dims(weight, axis=1)
 
+        print(weight.shape)
         def poisson_loss(y_true, y_pred):
-            return tensor_poisson_likelihood(y_true, y_pred, 0.5, 1.)
+            return tensor_poisson_likelihood(y_true, y_pred, 0.4, 1.3)
         adam = keras.optimizers.Adam(learning_rate=0.0005)
         model.compile(loss=poisson_loss, optimizer=adam, weighted_metrics=[])
-        
+#        model.compile(loss="mae", optimizer=adam, weighted_metrics=[])
+        print(model.summary())
         # Setup the callbacks, checkpointing, logger and early stopper
         csv_logger = keras.callbacks.CSVLogger('training.log')
         reduce_lr = keras.callbacks.ReduceLROnPlateau(monitor='val_loss', factor=0.5,
@@ -435,7 +455,7 @@ class TemplateFitter(Tool):
 
         model.fit(inputs.astype("float32"), target.astype("float32"), epochs=2000,
                 batch_size=1000,shuffle=True, validation_split=0.2,
-                #sample_weight = np.log2(max_out),
+#                sample_weight = weight,
                 callbacks=[csv_logger, reduce_lr,  model_checkpoint_callback, stopping])
 
         return model

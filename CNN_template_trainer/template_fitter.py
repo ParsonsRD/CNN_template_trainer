@@ -12,11 +12,11 @@ import numpy as np
 import tensorflow as tf
 
 from ctapipe.calib import CameraCalibrator, GainSelector
-from ctapipe.core import Tool#, QualityQuery
+from ctapipe.core import Tool, QualityQuery
 from ctapipe.core.traits import classes_with_traits, Unicode, Float, Integer, Bool
-#from ctapipe.image import ImageCleaner, ImageModifier, ImageProcessor
-#from ctapipe.image.extractor import ImageExtractor
-#from ctapipe.reco.reconstructor import StereoQualityQuery
+from ctapipe.image import ImageCleaner, ImageModifier, ImageProcessor
+from ctapipe.image.extractor import ImageExtractor
+from ctapipe.reco.reconstructor import StereoQualityQuery
 from ctapipe.instrument import get_atmosphere_profile_functions
 
 from ctapipe.io import (
@@ -137,17 +137,18 @@ class TemplateFitter(Tool):
     classes = (
         [
             CameraCalibrator,
-        #    ImageProcessor,
+            ImageProcessor,
             metadata.Instrument,
             metadata.Contact,
         ]
         + classes_with_traits(EventSource)
-        #+ classes_with_traits(ImageCleaner)
-        #+ classes_with_traits(ImageExtractor)
+        + classes_with_traits(ImageCleaner)
+        + classes_with_traits(ImageExtractor)
         + classes_with_traits(GainSelector)
-        #+ classes_with_traits(QualityQuery)
-        #+ classes_with_traits(ImageModifier)
-        #+ classes_with_traits(EventTypeFilter)
+        + classes_with_traits(QualityQuery)
+        + classes_with_traits(StereoQualityQuery)        
+        + classes_with_traits(ImageModifier)
+        + classes_with_traits(EventTypeFilter)
 
     )
 
@@ -183,11 +184,11 @@ class TemplateFitter(Tool):
         self.calibrate = CameraCalibrator(
             parent=self, subarray=self.event_source.subarray
         )
-        #self.process_images = ImageProcessor(
-        #    subarray=self.event_source.subarray, parent=self
-        #)
+        self.process_images = ImageProcessor(
+            subarray=self.event_source.subarray, parent=self
+        )
         self.event_type_filter = EventTypeFilter(parent=self)
-        #self.check_parameters = StereoQualityQuery(parent=self) 
+        self.check_parameters = StereoQualityQuery(parent=self) 
         
         # warn if max_events prevents writing the histograms
         if (
@@ -240,7 +241,7 @@ class TemplateFitter(Tool):
 
                 self.log.debug("Processessing event_id=%s", event.index.event_id)
                 self.calibrate(event)
-                #self.process_images(event)
+                self.process_images(event)
 
                 self.read_template(event)
                 if self.image_count>self.image_number-1 and self.image_number>0:
@@ -259,12 +260,8 @@ class TemplateFitter(Tool):
 
         if self.load_images:
             with np.load(self.input_files) as data:
-                try:
-                    inputs= data['inputs']
-                    target = data['target']
-                except:
-                    inputs= data['input_data']
-                    target = data['output_data']
+                inputs= data['inputs']
+                target = data['target']
         else:
             inputs = np.stack((self.x_all, self.y_all, self.impact_all, 
                             self.en_all, self.xmax_all, self.x0_all), axis=3)
@@ -274,7 +271,6 @@ class TemplateFitter(Tool):
         if self.save_images != " ":
             np.savez_compressed(self.save_images, inputs=inputs, target=target) 
             
-#        inputs[:,:,:,1] = np.abs(inputs[:,:,:,1])
         inputs[:,:,:,2:] = np.log10(inputs[:,:,:,2:]) 
         inputs = inputs[:,:,:,:-1]
         print(inputs.shape)
@@ -345,11 +341,11 @@ class TemplateFitter(Tool):
         # Loop over triggered telescopes
         for tel_id, dl1 in event.dl1.tel.items():
             #  Get pixel signal
-            #if np.all(self.check_parameters(parameters=dl1.parameters)) is False:
-            #    continue
+
             if self.event_source.subarray.tel[tel_id].camera.name != self.camera_type:
                 continue
-
+            if np.invert(self.check_parameters(parameters=dl1.parameters).all()):
+                continue
             pmt_signal = dl1.image
 
             # Get pixel coordinates and convert to the nominal system

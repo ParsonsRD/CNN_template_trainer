@@ -285,7 +285,7 @@ class TemplateFitter(Tool):
         weight_factor = (energy/(self.reweight_energy * u.TeV))**self.reweight_index
         if weight_factor != 1.:
             random_value = np.random.rand()
-            if random_value < weight_factor:
+            if random_value > weight_factor:
                 return
 
         # When calculating alt we have to account for the case when it is rounded

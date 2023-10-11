@@ -18,6 +18,7 @@ from ctapipe.image import ImageCleaner, ImageModifier, ImageProcessor
 from ctapipe.image.extractor import ImageExtractor
 from ctapipe.reco.reconstructor import StereoQualityQuery
 from ctapipe.instrument import get_atmosphere_profile_functions
+from ctapipe.image import dilate
 
 from ctapipe.io import (
     DataLevel,
@@ -34,6 +35,8 @@ from ctapipe.coordinates import (
 
 from ctapipe.utils import EventTypeFilter
 from astropy.time import Time
+
+from sklearn.model_selection import train_test_split
 
 from CNN_template_trainer.utilities import *
 import keras
@@ -213,7 +216,7 @@ class TemplateFitter(Tool):
 
         self.count_total = 0
         self.image_count = 0
-        self.x_all, self.y_all, self.en_all, self.impact_all, self.xmax_all, self.x0_all, self.image_all = [], [], [], [], [], [], []
+        self.inputs, self.amplitude, self.time = [], [], []
 
     def start(self):
         """
@@ -261,22 +264,37 @@ class TemplateFitter(Tool):
         if self.load_images:
             with np.load(self.input_files) as data:
                 inputs= data['inputs']
-                target = data['target']
+                amplitude = data['amplitude']
+                time = data['time']
+
         else:
-            inputs = np.stack((self.x_all, self.y_all, self.impact_all, 
-                            self.en_all, self.xmax_all, self.x0_all), axis=3)
-            inputs = inputs.astype("float32")
-            target = np.array(self.image_all).astype("float32")
+            inputs = np.array(self.inputs)
+            amplitude = np.array(self.amplitude)
+            time = np.array(self.time)
 
         if self.save_images != " ":
-            np.savez_compressed(self.save_images, inputs=inputs, target=target) 
+            np.savez_compressed(self.save_images, inputs=inputs, amplitude=amplitude, time=time)
             
-        inputs[:,:,:,2:] = np.log10(inputs[:,:,:,2:]) 
-        inputs = inputs[:,:,:,:-1]
-        print(inputs.shape)
+        inputs[:,2:] = np.log10(inputs[:,2:])
+        inputs = inputs[:,:-1]
         inputs = np.nan_to_num(inputs, posinf=0, neginf=0)
-        target = np.nan_to_num(target, posinf=0, neginf=0)
-        
+
+        inputs, inputs_shuffle, amplitude, amplitude_shuffle, time, time_shuffle = train_test_split(inputs, amplitude, time, test_size=0.5)
+        np.random.shuffle(amplitude_shuffle)
+        np.random.shuffle(time_shuffle)   
+
+        target = np.ones_like(amplitude)
+        target_shuffle = np.zeros_like(amplitude_shuffle)
+
+        print(inputs.shape, amplitude.shape)
+        inputs = np.hstack((inputs, np.expand_dims(amplitude, axis=1)))
+        inputs_shuffle = np.hstack((inputs_shuffle, np.expand_dims(amplitude_shuffle, axis=1)))
+
+        target = np.concatenate((target, target_shuffle))
+        inputs = np.concatenate((inputs, inputs_shuffle))
+
+        inputs, inputs_test, target, target_test = train_test_split(inputs, target, test_size=0.1)
+
         model = self.generate_templates(inputs, target)
         model.save(self.output_file)
 
@@ -346,10 +364,14 @@ class TemplateFitter(Tool):
                 continue
             if np.invert(self.check_parameters(parameters=dl1.parameters).all()):
                 continue
-            pmt_signal = dl1.image
+            mask = event.dl1.tel[tel_id].image_mask
+            geom = self.event_source.subarray.tel[tel_id].camera.geometry
+
+            for i in range(4):
+                mask = dilate(geom, mask)
+            pmt_signal = dl1.image[mask]
 
             # Get pixel coordinates and convert to the nominal system
-            geom = self.event_source.subarray.tel[tel_id].camera.geometry
             fl = self.event_source.subarray.tel[tel_id].optics.effective_focal_length
 
             camera_coord = SkyCoord(x=geom.pix_x, y=geom.pix_y,
@@ -358,8 +380,8 @@ class TemplateFitter(Tool):
             nom_coord = camera_coord.transform_to(
                 NominalFrame(origin=self.point))
 
-            x = nom_coord.fov_lon.to(u.deg)
-            y = nom_coord.fov_lat.to(u.deg)
+            x = nom_coord.fov_lon.to(u.deg)[mask]
+            y = nom_coord.fov_lat.to(u.deg)[mask]
 
             tel_num = np.argwhere(self.event_source.subarray.tel_ids == tel_id)
             # Calculate expected rotation angle of the image
@@ -388,30 +410,12 @@ class TemplateFitter(Tool):
             h0 =  event.simulation.shower.h_first_int
             x0 = self.thickness_profile(h0)/np.cos(np.deg2rad(zen))
 
-            # Now fill up our output with the X, Y and amplitude of our pixels
-            img_out = geom.image_to_cartesian_representation(pmt_signal)
-
-            x_out, y_out, en_out, impact_out, xmax_out, x0_out = np.zeros_like(img_out), np.zeros_like(img_out), \
-                np.zeros_like(img_out), np.zeros_like(img_out), \
-                np.zeros_like(img_out), np.zeros_like(img_out)
-            
-            pixels = geom.image_index_to_cartesian_index(range(len(pmt_signal)))
-            x_out[pixels] = x
-            y_out[pixels] = y
-            en_out[pixels] = energy
-            impact_out[pixels] = impact
-            xmax_out[pixels] = mc_xmax
-            x0_out[pixels] = x0
+            for i in range(len(x)):
+                self.inputs.append((x[i].to(u.deg).value, y[i].to(u.deg).value, energy.value, impact[0][0], mc_xmax, x0))
+                self.amplitude.append(pmt_signal[i])
+                self.time.append(pmt_signal[i])
 
             self.image_count += 1
-
-            self.x_all.append(x_out)
-            self.y_all.append(y_out)
-            self.en_all.append(en_out)
-            self.impact_all.append(impact_out)
-            self.image_all.append(img_out)
-            self.xmax_all.append(xmax_out)
-            self.x0_all.append(x0_out)
 
     def generate_templates(self, inputs, target):
         """_summary_
@@ -423,16 +427,13 @@ class TemplateFitter(Tool):
         Returns:
             _type_: _description_
         """
-        model = create_model_cnn(inputs.shape[1:], filters=self.filters, number_of_layers=self.layers)
-        impacts = 10**inputs[:, 20,20,2]
-        weight = (impacts/150)**-0.7
-        weight =  np.expand_dims(weight, axis=1)
+        model = create_model((6))
+        #impacts = 10**inputs[:, 20,20,2]
+        #weight = (impacts/150)**-0.7
+        #weight =  np.expand_dims(weight, axis=1)
 
-        print(weight.shape)
-        def poisson_loss(y_true, y_pred):
-            return tensor_poisson_likelihood(y_true, y_pred, 0.4, 1.3)
-        adam = keras.optimizers.Adam(learning_rate=0.0005)
-        model.compile(loss=poisson_loss, optimizer=adam, weighted_metrics=[])
+        adam = keras.optimizers.Adam(learning_rate=0.001)
+        model.compile(loss="binary_crossentropy", optimizer=adam, weighted_metrics=[])
 #        model.compile(loss="mae", optimizer=adam, weighted_metrics=[])
         print(model.summary())
         # Setup the callbacks, checkpointing, logger and early stopper
@@ -450,7 +451,7 @@ class TemplateFitter(Tool):
                                                     restore_best_weights=True, start_from_epoch=100)
 
         model.fit(inputs.astype("float32"), target.astype("float32"), epochs=2000,
-                batch_size=1000,shuffle=True, validation_split=0.2,
+                batch_size=10000,shuffle=True, validation_split=0.2,
 #                sample_weight = weight,
                 callbacks=[csv_logger, reduce_lr,  model_checkpoint_callback, stopping])
 
